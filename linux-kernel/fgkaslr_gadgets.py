@@ -108,17 +108,34 @@ def show_gadgets():
     for gadget in gadgets:
         line = "%#x : %s" % (gadget[0], gadget[1])
         print(line)
-        
-size_dict = get_func_size()
-offset_dict = get_invariant_func_offsets()
 
-data = np.array(list(offset_dict.values()))
-data = data.reshape(data.shape[0], 1)
-clusters = hcluster.fclusterdata(data, 0x200, criterion="distance")
+if __name__ == '__main__':
+    import argparse
 
-for cid in range(1, clusters.max()+1):
-    region = data[clusters == cid]
-    do_gadget_search(int(region.min()), int(region.max()))
+    # parse arguments
+    parser = argparse.ArgumentParser(description='Scripts to find gadgets in position-invariant region in linux kernel compiled with FG-KASLR',
+                                     usage="%(prog)s [options] -b <path_to_bzImage> -e <path_to_vmlinux> -i <path_to_initramfs>")
+    parser.add_argument('-b', '--bin', type=str,
+                        help="specify path to bzImage/vmlinuz", required=True)
+    parser.add_argument('-e', '--elf', type=str,
+                        help="specify path to vmlinux", required=True)
+    parser.add_argument('-i', '--initrd', type=str,
+                        help="specify path to initramfs", required=True)
+    args = parser.parse_args()
 
-gadgets = clean_gadgets()
-show_gadgets()
+    KERNEL_BIN = args.bin
+    ROOTFS = args.initrd
+    KERNEL_ELF = args.elf
+
+    offset_dict = get_invariant_func_offsets()
+
+    data = np.array(list(offset_dict.values()))
+    data = data.reshape(data.shape[0], 1)
+    clusters = hcluster.fclusterdata(data, 0x200, criterion="distance")
+
+    for cid in range(1, clusters.max()+1):
+        region = data[clusters == cid]
+        do_gadget_search(int(region.min()), int(region.max()))
+
+    gadgets = clean_gadgets()
+    show_gadgets()
