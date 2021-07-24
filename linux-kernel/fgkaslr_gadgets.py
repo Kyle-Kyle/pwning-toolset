@@ -1,141 +1,155 @@
+import re
 from pwn import *
-import numpy as np
-import scipy.cluster.hierarchy as hcluster
 
-KERNEL_BIN = "./vmlinuz"
-ROOTFS = "./rootfs.img"
 KERNEL_ELF = "./vmlinux"
 
 elf = ELF(KERNEL_ELF)
 
 gadgets = []
+functions = []
+holes = []
 
-def launch():
-    log.info("Launching QEMU...")
-    cmd = ['qemu-system-x86_64', '-m', '1G', '-cpu', 'host', '--enable-kvm', '-initrd', ROOTFS, '-kernel', KERNEL_BIN, '-nographic', '-monitor', '/dev/null', '-append', '"console=ttyS0 kaslr quiet panic=1"']
-    r = process(cmd)
-    output = r.recvregex(b"/ (\$|#) ", timeout=10)
-    prompt = output.splitlines()[-1]
-    assert b'#' in prompt, "you must be root to use this script!"
-    return r
+class Gadget:
+    def __init__(self, addr, assembly, raw_bytes):
+        self.addr = addr
+        self.assembly = assembly
+        self.raw_bytes = raw_bytes
+        self.start_addr = addr
+        self.end_addr = addr + len(raw_bytes)
 
-def parse_kallsyms(r):
-    log.info("Trying to grab and parse kallsyms...")
+    def is_overlap(self, hole):
+        if self.end_addr <= hole[0]:
+            return False
+        if self.start_addr >= hole[1]:
+            return False
+        return True
 
-    # grab raw kallsyms output first
-    r.sendline(b"cat /proc/kallsyms")
-    output = r.recvuntil(b"#")
+class Function:
+    def __init__(self, name, addr, size):
+        self.name = name
+        self.addr = addr
+        self.size = size
+        self.start_addr = addr
+        self.end_addr = addr + size
 
-    # grab kernel text entries
-    entries = [x.split() for x in output.splitlines() if len(x.split()) == 3]
-    text_entries = [x for x in entries if x[1].lower() == b't']
-
-    # calculate function offsets
-    base = [x for x in text_entries if x[2] == b'_stext'][0][0]
-    base = int(base, 16)
-    d = {x[2]: int(x[0], 16)-base for x in text_entries}
-
-    return d
-
-def get_fresh_offsets():
-    r = launch()
-    sym = parse_kallsyms(r)
-    r.close()
-    return sym
-
-def get_func_size():
-    log.info("Trying to grab function size...")
-    d = {}
+def get_func_info():
+    log.info("Trying to collect position-variant function information...")
     for x in elf.sections:
         if not x.name.startswith(".text."):
             continue
-        func_size = len(x.data())
-        func_name = x.name[6:]
-        d[func_name] = func_size
-    return d
+        func = Function(x.name[6:], x.header.sh_addr, len(x.data()))
+        functions.append(func)
+    log.success("%d position-variant functions collected!", len(functions))
 
-def get_invariant_func_offsets():
-    log.info("Trying to identify invariant function offsets")
-    off1 = get_fresh_offsets()
-    off2 = get_fresh_offsets()
-    off3 = get_fresh_offsets()
-    
-    offsets = {x:off1[x] for x in off1 if x in off1 and x in off2 and x in off3 and off1[x] == off2[x] and off2[x] == off3[x]}
-
-    # be careful, we only grab functions from .text section, not .init stuff
-    offsets = {x:offsets[x] for x in offsets if offsets[x] < 0xc00000}
-
-    log.success(f"Identified {len(offsets)} invariant functions!")
-    return offsets
-
-def virt_to_phys(offset):
-    return elf.vaddr_to_offset(elf.address+offset)
-
-def do_gadget_search(min_offset, max_offset):
+def get_all_gadgets():
     """
+    search for all gadgets in the kernel .text section
     translate virtual address and file offset back and forth so that fking ROPgadget won't eat up the memory of my computer
     """
-    min_phys_off = virt_to_phys(min_offset)
-    max_phys_off = virt_to_phys(max_offset)
+    log.info("Collecting all gadgets...")
+    MIN_ADDR = 0xffffffff81000000
+    MAX_ADDR = 0xffffffff81c00000
+    min_phys_off = elf.vaddr_to_offset(MIN_ADDR)
+    max_phys_off = elf.vaddr_to_offset(MAX_ADDR)
 
-    cmd = b"ROPgadget --binary ./vmlinux --rawArch=x86 --rawMode=64 --range %#x-%#x" % (min_phys_off, max_phys_off)
+    cmd = "ROPgadget --binary %s --rawArch=x86 --rawMode=64 --range %#x-%#x --dump --all" % (KERNEL_ELF, min_phys_off, max_phys_off)
     output = subprocess.getoutput(cmd)
 
+    log.info("Parsing all gadgets...")
     for line in output.splitlines():
         if not line.startswith("0x"):
             continue
-        elem = line.split(' : ')
-        phys_off = int(elem[0], 16)
-        vaddr = elf.offset_to_vaddr(phys_off)
 
-        gadgets.append((vaddr, elem[1]))
+        # parse each gadget entry
+        res = re.match('(0x[0-f]+) : (.+) // (.*)', line)
+        assert res is not None
+
+        addr = elf.offset_to_vaddr(int(res.group(1), 16))
+        assembly = res.group(2)
+        raw_bytes = bytes.fromhex(res.group(3))
+
+        # create each gadget object
+        gadget = Gadget(addr, assembly, raw_bytes)
+        gadgets.append(gadget)
+    log.success("%d gadgets collected!", len(gadgets))
+
+def filter_gadgets():
+    global gadgets
+    log.info("Filtering gadgets that overlap with position-variant functions...")
+    raw_gadgets = gadgets
+    gadgets = []
+    for idx, gadget in enumerate(raw_gadgets):
+        for hole in holes:
+            if gadget.is_overlap(hole):
+                break
+        else:
+            gadgets.append(gadget)
+    log.success("%d position-invariant gadgets collected!", len(gadgets))
 
 def clean_gadgets():
     # de-duplicate gadgets
     seen = set()
     new_gadgets = []
     for gadget in gadgets:
-        if gadget[1] in seen:
+        if gadget.assembly in seen:
             continue
         new_gadgets.append(gadget)
-        seen.add(gadget[1])
+        seen.add(gadget.assembly)
 
     # sort gadgets
-    new_gadgets.sort(key = lambda x: x[1])
+    new_gadgets.sort(key = lambda x: x.assembly)
+    log.success("%d unique position-invariant gadgets collected!", len(new_gadgets))
     return new_gadgets
 
 def show_gadgets():
     for gadget in gadgets:
-        line = "%#x : %s" % (gadget[0], gadget[1])
+        line = "%#x : %s" % (gadget.addr, gadget.assembly)
         print(line)
 
-if __name__ == '__main__':
-    import argparse
+def merge_holes():
+    log.info("Trying to reduce search complexity by merging holes...")
+    global holes
+    tmp_holes = []
+    for idx, func in enumerate(functions):
 
-    # parse arguments
-    parser = argparse.ArgumentParser(description='Scripts to find gadgets in position-invariant region in linux kernel compiled with FG-KASLR',
-                                     usage="%(prog)s [options] -b <path_to_bzImage> -e <path_to_vmlinux> -i <path_to_initramfs>")
-    parser.add_argument('-b', '--bin', type=str,
-                        help="specify path to bzImage/vmlinuz", required=True)
-    parser.add_argument('-e', '--elf', type=str,
-                        help="specify path to vmlinux", required=True)
-    parser.add_argument('-i', '--initrd', type=str,
-                        help="specify path to initramfs", required=True)
-    args = parser.parse_args()
+        # determine the start of next function
+        if idx != len(functions) - 1:
+            next_start_addr = functions[idx+1].start_addr
+        else:
+            next_start_addr = func.end_addr
 
-    KERNEL_BIN = args.bin
-    ROOTFS = args.initrd
-    KERNEL_ELF = args.elf
+        # check whether the function padding is interesting, if not, we include the padding
+        # in the hole to reduce search complexity
+        hole_start = func.start_addr
+        func_pad_len = next_start_addr-func.end_addr
+        func_padding = elf.read(func.end_addr, func_pad_len)
+        if func_padding == b'\x00' * func_pad_len:
+            hole_end = next_start_addr
+        else:
+            hole_end = func.end_addr
 
-    offset_dict = get_invariant_func_offsets()
+        tmp_holes.append((hole_start, hole_end))
 
-    data = np.array(list(offset_dict.values()))
-    data = data.reshape(data.shape[0], 1)
-    clusters = hcluster.fclusterdata(data, 0x200, criterion="distance")
+    # merge holes to reduce search complexity
+    while True:
+        for idx in range(len(tmp_holes)-1):
+            hole = tmp_holes[idx]
+            next_hole = tmp_holes[idx+1]
+            if hole[1] != next_hole[0]:
+                continue
+            new_hole = (hole[0], next_hole[1])
+            tmp_holes[idx+1] = new_hole
+            tmp_holes.remove(hole)
+            break
+        else:
+            break
 
-    for cid in range(1, clusters.max()+1):
-        region = data[clusters == cid]
-        do_gadget_search(int(region.min()), int(region.max()))
+    holes = tmp_holes
+    log.success("%d holes detected!", len(holes))
 
-    gadgets = clean_gadgets()
-    show_gadgets()
+get_func_info()
+merge_holes()
+get_all_gadgets()
+filter_gadgets()
+gadgets = clean_gadgets()
+show_gadgets()
