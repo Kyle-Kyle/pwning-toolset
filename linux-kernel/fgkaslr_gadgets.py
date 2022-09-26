@@ -1,10 +1,10 @@
 import re
+from elftools.elf.elffile import ELFFile
+
 from pwn import *
 
-KERNEL_ELF = "./vmlinux"
-
-elf = ELF(KERNEL_ELF)
-
+KERNEL_ELF = None
+elf = None
 gadgets = []
 functions = []
 holes = []
@@ -47,10 +47,17 @@ def get_all_gadgets():
     translate virtual address and file offset back and forth so that fking ROPgadget won't eat up the memory of my computer
     """
     log.info("Collecting all gadgets...")
-    MIN_ADDR = 0xffffffff81000000
-    MAX_ADDR = 0xffffffff81c00000
-    min_phys_off = elf.vaddr_to_offset(MIN_ADDR)
-    max_phys_off = elf.vaddr_to_offset(MAX_ADDR)
+    #MIN_ADDR = 0xffffffff81000000
+    #MAX_ADDR = 0xffffffff81c00000
+    with open(KERNEL_ELF, "rb") as f:
+        elffile = ELFFile(f)
+        text = elffile.get_section_by_name(".text")
+        TEXT_START = text.header['sh_addr']
+        TEXT_END = TEXT_START + text.header['sh_size']
+    print("start: %#x" % TEXT_START)
+    print("end  : %#x" % TEXT_END)
+    min_phys_off = elf.vaddr_to_offset(TEXT_START)
+    max_phys_off = elf.vaddr_to_offset(TEXT_END)
 
     cmd = "ROPgadget --binary %s --rawArch=x86 --rawMode=64 --range %#x-%#x --dump --all" % (KERNEL_ELF, min_phys_off, max_phys_off)
     output = subprocess.getoutput(cmd)
@@ -145,11 +152,25 @@ def merge_holes():
             break
 
     holes = tmp_holes
+    print(holes)
     log.success("%d holes detected!", len(holes))
 
-get_func_info()
-merge_holes()
-get_all_gadgets()
-filter_gadgets()
-gadgets = clean_gadgets()
-show_gadgets()
+if __name__ == "__main__":
+    import argparse
+
+    import monkeyhex
+    parser = argparse.ArgumentParser(description='Script to find position-invariant gadgets in Linux kernels compiled with FG-KASLR',
+                                     usage="%(prog)s [options] <vmlinux_path>")
+    parser.add_argument('vmlinux_path',  type=str,
+                        help="path to vmlinux")
+    args = parser.parse_args()
+
+    KERNEL_ELF = args.vmlinux_path
+    elf = ELF(args.vmlinux_path)
+
+    get_func_info()
+    merge_holes()
+    get_all_gadgets()
+    filter_gadgets()
+    gadgets = clean_gadgets()
+    show_gadgets()
